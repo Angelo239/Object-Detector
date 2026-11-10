@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object Detection by Category with Voice Announcement</title>
+<style>
+  :root { --bg:#f3f5f7; --panel:#fff; --ink:#14212b; --muted:#5b6b78; --line:#d5dde3; --accent:#0a7c6a; --bad:#b3261e; --good:#1b7f3b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", system-ui, sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 22px; background:var(--panel); border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:1.15rem; margin:0; font-weight:650; }
+  .status { display:flex; gap:14px; margin-left:auto; font-size:.9rem; flex-wrap:wrap; }
+  .pill { display:flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#9aa7b1; flex:none; }
+  .dot.on { background:var(--good); } .dot.err { background:var(--bad); }
+  main { display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:18px; padding:18px 22px; }
+  @media (max-width:860px){ main{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+  .stage { position:relative; background:#0b1116; border-radius:6px; overflow:hidden; aspect-ratio:16/9; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; align-items:center; }
+  select, button { font:inherit; padding:8px 12px; border-radius:6px; border:1px solid var(--line); background:#fff; color:var(--ink); }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  button:focus-visible, select:focus-visible { outline:3px solid #7fc8bb; outline-offset:2px; }
+  h2 { font-size:1rem; margin:0 0 8px; }
+  ul { list-style:none; margin:0; padding:0; }
+  .empty { color:var(--muted); font-size:.92rem; }
+  .group { margin-bottom:10px; }
+  .group:last-child { margin-bottom:0; }
+  .group-head { display:flex; align-items:center; gap:8px; font-weight:650; font-size:.95rem; padding-bottom:4px; border-bottom:2px solid var(--line); }
+  .swatch { width:12px; height:12px; border-radius:3px; flex:none; }
+  .count { margin-left:auto; color:var(--muted); font-weight:400; font-size:.85rem; }
+  .row { display:flex; justify-content:space-between; padding:5px 0 5px 20px; font-size:.92rem; border-bottom:1px solid #eef1f3; }
+  .row:last-child { border-bottom:0; }
+  .conf { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .log li { display:flex; justify-content:space-between; gap:8px; padding:6px 0; border-bottom:1px solid var(--line); font-size:.9rem; }
+  .log li:last-child { border-bottom:0; }
+  .tag { font-size:.8rem; padding:1px 8px; border-radius:10px; color:#fff; margin-left:6px; white-space:nowrap; }
+  .field { display:flex; align-items:center; gap:8px; font-size:.9rem; color:var(--muted); }
+  input[type=range] { width:110px; }
+  .hint { font-size:.85rem; color:var(--muted); margin-top:10px; line-height:1.4; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Object detection by category with voice announcement</h1>
+  <div class="status" aria-live="polite">
+    <span class="pill"><span class="dot" id="dotCam"></span><span id="txtCam">Camera: not connected</span></span>
+    <span class="pill"><span class="dot" id="dotModel"></span><span id="txtModel">Model: not loaded</span></span>
+  </div>
+</header>
+
+<main>
+  <section class="panel">
+    <div class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="controls">
+      <select id="camSelect" aria-label="Choose camera"></select>
+      <select id="modelSelect" aria-label="Choose model">
+        <option value="lite2">Accurate model (EfficientDet-Lite2)</option>
+        <option value="lite0">Fast model (EfficientDet-Lite0)</option>
+      </select>
+      <button class="primary" id="btnStart">Start camera and detection</button>
+      <button id="btnStop" disabled>Stop</button>
+      <label class="field"><input type="checkbox" id="chkVoice" checked> Voice</label>
+      <label class="field"><input type="checkbox" id="chkCommon"> Common objects only</label>
+      <label class="field">Min. confidence <input type="range" id="rngConf" min="20" max="95" value="50"><span id="valConf">50%</span></label>
+    </div>
+    
+  </section>
+
+  <aside style="display:grid; gap:18px; align-content:start;">
+    <section class="panel">
+      <h2>Detected now, by category</h2>
+      <div id="current"><p class="empty">Nothing detected yet.</p></div>
+    </section>
+    <section class="panel">
+      <h2>Found this session</h2>
+      <div id="session"><p class="empty">No objects announced yet.</p></div>
+    </section>
+    <section class="panel">
+      <h2>Announcements</h2>
+      <ul id="log" class="log"><li class="empty">No announcements yet.</li></ul>
+    </section>
+  </aside>
+</main>
+
+<script type="module">
+import { ObjectDetector, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm";
+const $ = id => document.getElementById(id);
+const video = $('video'), canvas = $('overlay'), ctx = canvas.getContext('2d');
+let model = null, loadedModelKey = null, stream = null, running = false, lastVideoTime = -1;
+
+// ---- Categories: every one of the 80 COCO object classes belongs to one of these ----
+const CATEGORIES = {
+  'Gadgets':            { color:'#1f6feb', items:['cell phone','laptop','keyboard','mouse','remote','tv'] },
+  'People':             { color:'#d6336c', items:['person'] },
+  'Food':               { color:'#e8590c', items:['banana','apple','sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake'] },
+  'Kitchenware':        { color:'#0b7285', items:['bottle','wine glass','cup','fork','knife','spoon','bowl'] },
+  'Furniture':          { color:'#8d5a2b', items:['chair','couch','bed','dining table','bench','toilet'] },
+  'Bags & accessories': { color:'#7048e8', items:['backpack','handbag','suitcase','umbrella', 'wallet','tie'] },
+  'School & office':    { color:'#2b8a3e', items:['book','scissors'] },
+  'Household items':    { color:'#868e96', items:['clock','vase','teddy bear','toothbrush','potted plant','hair drier'] },
+  'Appliances':         { color:'#c2255c', items:['microwave','oven','toaster','refrigerator','sink'] },
+  'Sports':             { color:'#f08c00', items:['frisbee','skis','snowboard','sports ball','kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket'] },
+  'Vehicles':           { color:'#364fc7', items:['bicycle','car','motorcycle','airplane','bus','train','truck','boat'] },
+  'Animals':            { color:'#5c940d', items:['bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe'] },
+  'Street objects':     { color:'#495057', items:['traffic light','fire hydrant','stop sign','parking meter'] }
+};
+const CLASS_TO_CAT = {};
+for (const [cat, info] of Object.entries(CATEGORIES)) info.items.forEach(i => CLASS_TO_CAT[i] = cat);
+const catOf = c => CLASS_TO_CAT[c] || 'Other';
+const colorOf = cat => (CATEGORIES[cat] ? CATEGORIES[cat].color : '#555');
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+// Some classes score lower than most objects, so they get a more forgiving threshold
+const HARD = new Set(['cell phone','remote','mouse','scissors','toothbrush','book','knife','fork','spoon']);
+function thresholdFor(cls, min) {
+  let thr = HARD.has(cls) ? Math.max(0.3, min - 0.1) : min;      // slider still controls hard classes
+  const t = tracks[cls];
+  if (t && t.present) thr = Math.max(0.25, thr - 0.15);          // hysteresis: easier to keep than to start
+  return thr;
+}
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]), y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[0] + a[2], b[0] + b[2]), y2 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return i / ((a[2] * a[3] + b[2] * b[3] - i) || 1);
+}
+// One box = one label: if several labels fight over the same object, only the best-scoring one survives
+function dedupe(preds) {
+  const out = [];
+  for (const p of preds.sort((a, b) => b.score - a.score))
+    if (!out.some(q => iou(p.bbox, q.bbox) > 0.6)) out.push(p);
+  return out;
+}
+
+// "Common objects only" keeps the demo to everyday items (OFF by default so every registered class is detected)
+const COMMON = new Set(['person','bottle','cup','cell phone','book','laptop','keyboard','mouse','backpack','apple','banana','orange','remote','scissors','clock','umbrella','chair','bowl','fork','knife','spoon','handbag','tv','teddy bear','vase','toothbrush']);
+
+const MODELS = {
+  lite2: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite',
+  lite0: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite'
+};
+
+// ---- Announcement rules ----
+const WINDOW_MS = 1200;       // look at the last 1.2 s of detection passes
+const MIN_HITS = 3;           // label must appear in at least 3 passes...
+const MIN_RATIO = 0.5;        // ...and in at least half of all passes in the window
+const CONFIRM_MS = 500;       // ...spanning at least 0.5 s
+const passes = [];            // timestamps of recent detection passes
+const ABSENT_MS = 2500;       // must leave view this long before it can be announced again
+const COOLDOWN_MS = 6000;     // never repeat the same label within this time
+const tracks = {};            // label -> {streak, firstSeen, lastSeen, lastSpoken, present}
+const sessionFound = {};      // category -> Set of object names announced
+
+function setStatus(dot, txt, state, text) { $(dot).className = 'dot ' + state; $(txt).textContent = text; }
+
+async function listCameras() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter(d => d.kind === 'videoinput');
+  const sel = $('camSelect'); const prev = sel.value; sel.innerHTML = '';
+  cams.forEach((c, i) => sel.add(new Option(c.label || ('Camera ' + (i + 1)), c.deviceId)));
+  if (prev) sel.value = prev;
+}
+
+async function createDetector(fileset, url, delegate) {
+  return ObjectDetector.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: url, delegate },
+    runningMode: 'VIDEO', scoreThreshold: 0.2, maxResults: 30 });
+}
+
+async function loadModel() {
+  const key = $('modelSelect').value;
+  if (model && loadedModelKey === key) return;
+  const old = model; model = null;           // loop pauses detection while loading
+  if (old && old.close) old.close();
+  setStatus('dotModel', 'txtModel', '', 'Model: loading…');
+  const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  let usedKey = key;
+  const tryLoad = async k => {
+    try { return await createDetector(fileset, MODELS[k], 'GPU'); }
+    catch (e) { return await createDetector(fileset, MODELS[k], 'CPU'); }
+  };
+  try { model = await tryLoad(key); }
+  catch (e) {
+    if (key !== 'lite0') { usedKey = 'lite0'; $('modelSelect').value = 'lite0'; model = await tryLoad('lite0'); }
+    else throw e;
+  }
+  loadedModelKey = usedKey;
+  setStatus('dotModel', 'txtModel', 'on', 'Model: EfficientDet-' + (usedKey === 'lite2' ? 'Lite2' : 'Lite0') + ' ready');
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const id = $('camSelect').value;
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: id ? { deviceId: { exact: id }, width: 1280, height: 720 } : { width: 1280, height: 720 }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+  await listCameras();
+  const label = stream.getVideoTracks()[0].label;
+  setStatus('dotCam', 'txtCam', 'on', 'Camera: active (' + label + ')');
+  stream.getVideoTracks()[0].onended = () => setStatus('dotCam', 'txtCam', 'err', 'Camera: disconnected');
+}
+
+function speak(text) {
+  if (!$('chkVoice').checked || !('speechSynthesis' in window)) return;
+  if (speechSynthesis.pending) speechSynthesis.cancel();   // drop stale queued announcements
+  speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+}
+
+function addLog(name, cat) {
+  const ul = $('log'); if (ul.querySelector('.empty')) ul.innerHTML = '';
+  const li = document.createElement('li');
+  const left = document.createElement('span');
+  left.textContent = cap(name) + ' detected';
+  const tag = document.createElement('span');
+  tag.className = 'tag'; tag.textContent = cat; tag.style.background = colorOf(cat);
+  left.appendChild(tag);
+  const time = document.createElement('span');
+  time.className = 'conf'; time.textContent = new Date().toLocaleTimeString();
+  li.append(left, time);
+  ul.prepend(li); while (ul.children.length > 8) ul.lastChild.remove();
+}
+
+function renderSession() {
+  const box = $('session'); box.innerHTML = '';
+  const cats = Object.keys(sessionFound);
+  if (!cats.length) { box.innerHTML = '<p class="empty">No objects announced yet.</p>'; return; }
+  cats.forEach(cat => {
+    const g = document.createElement('div'); g.className = 'group';
+    g.innerHTML = '<div class="group-head"><span class="swatch"></span><span class="n"></span><span class="count"></span></div>';
+    g.querySelector('.swatch').style.background = colorOf(cat);
+    g.querySelector('.n').textContent = cat;
+    g.querySelector('.count').textContent = sessionFound[cat].size + (sessionFound[cat].size === 1 ? ' object' : ' objects');
+    const r = document.createElement('div'); r.className = 'row';
+    r.textContent = [...sessionFound[cat]].map(cap).join(', ');
+    g.appendChild(r); box.appendChild(g);
+  });
+}
+
+function handleAnnouncements(labels, now) {
+  const counts = labels.reduce((result, label) => {
+    result[label] = (result[label] || 0) + 1;
+    return result;
+  }, {});
+  const seenNow = new Set(Object.keys(counts));
+  const announcements = [];
+  passes.push(now); while (passes.length && passes[0] < now - WINDOW_MS) passes.shift();
+  for (const l of seenNow) {
+    const t = tracks[l] || (tracks[l] = { hits: [], lastSeen: 0, lastSpoken: 0, present: false });
+    t.hits.push(now); t.lastSeen = now;
+    while (t.hits.length && t.hits[0] < now - WINDOW_MS) t.hits.shift();
+    const confirmed = t.hits.length >= MIN_HITS && t.hits.length / passes.length >= MIN_RATIO && now - t.hits[0] >= CONFIRM_MS;
+    if (confirmed && !t.present && now - t.lastSpoken > COOLDOWN_MS) {
+      const cat = catOf(l);
+      announcements.push({ label: l, count: counts[l], category: cat });
+      addLog(l, cat);
+      (sessionFound[cat] = sessionFound[cat] || new Set()).add(l);
+      renderSession();
+      t.lastSpoken = now;
+    }
+    if (confirmed) t.present = true;
+  }
+  for (const l in tracks) {
+    if (!seenNow.has(l) && now - tracks[l].lastSeen > ABSENT_MS) {
+      tracks[l].hits = [];
+      tracks[l].present = false;
+    }
+  }
+  if (announcements.length) {
+    const total = announcements.reduce((sum, item) => sum + item.count, 0);
+    const details = announcements.map(item => item.count > 1
+      ? `${item.label} (${item.count})`
+      : item.label).join(', ');
+    const prefix = total > 1 ? `${total} objects detected: ` : '';
+    const categories = [...new Set(announcements.map(item => item.category))];
+    speak(prefix + details + '. Category: ' + categories.join(', ') + '.');
+  }
+}
+
+function draw(preds) {
+  if (canvas.width !== video.videoWidth) canvas.width = video.videoWidth;
+  if (canvas.height !== video.videoHeight) canvas.height = video.videoHeight;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineWidth = Math.max(3, canvas.width / 320);
+  const fs = Math.max(16, canvas.width / 45);
+  ctx.font = `600 ${fs}px Segoe UI, sans-serif`;
+  preds.forEach(p => {
+    const [x, y, w, h] = p.bbox, cat = catOf(p.class), col = colorOf(cat);
+    const text = `${p.class} (${cat}) ${Math.round(p.score * 100)}%`;
+    ctx.strokeStyle = col; ctx.strokeRect(x, y, w, h);
+    const tw = ctx.measureText(text).width + 12, th = fs + 10;
+    ctx.fillStyle = col; ctx.fillRect(x, Math.max(0, y - th), tw, th);
+    ctx.fillStyle = '#fff'; ctx.fillText(text, x + 6, Math.max(th - 6, y - 7));
+  });
+}
+
+function renderCurrent(preds) {
+  const box = $('current');
+  if (!preds.length) { box.innerHTML = '<p class="empty">Nothing detected.</p>'; return; }
+  const groups = {};
+  preds.forEach(p => (groups[catOf(p.class)] = groups[catOf(p.class)] || []).push(p));
+  box.innerHTML = '';
+  Object.keys(groups).forEach(cat => {
+    const g = document.createElement('div'); g.className = 'group';
+    g.innerHTML = '<div class="group-head"><span class="swatch"></span><span class="n"></span><span class="count"></span></div>';
+    g.querySelector('.swatch').style.background = colorOf(cat);
+    g.querySelector('.n').textContent = cat;
+    g.querySelector('.count').textContent = groups[cat].length;
+    groups[cat].forEach(p => {
+      const r = document.createElement('div'); r.className = 'row';
+      const a = document.createElement('span'); a.textContent = cap(p.class);
+      const b = document.createElement('span'); b.className = 'conf'; b.textContent = Math.round(p.score * 100) + '%';
+      r.append(a, b); g.appendChild(r);
+    });
+    box.appendChild(g);
+  });
+}
+
+function loop() {
+  if (!running) return;
+  try { step(); } catch (e) { console.warn('frame skipped:', e); }
+  requestAnimationFrame(loop);
+}
+function step() {
+  // Only run detection on a new video frame, and only when a model is loaded
+  if (model && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const min = $('rngConf').value / 100, onlyCommon = $('chkCommon').checked;
+    const res = model.detectForVideo(video, performance.now());
+    const preds = dedupe(res.detections.map(d => ({
+        class: d.categories[0].categoryName, score: d.categories[0].score,
+        bbox: [d.boundingBox.originX, d.boundingBox.originY, d.boundingBox.width, d.boundingBox.height] }))
+      .filter(p => CLASS_TO_CAT[p.class] && (!onlyCommon || COMMON.has(p.class)) && p.score >= thresholdFor(p.class, min)));
+    draw(preds); renderCurrent(preds);
+    handleAnnouncements(preds.map(p => p.class), performance.now());
+  }
+}
+
+$('rngConf').oninput = e => $('valConf').textContent = e.target.value + '%';
+
+// Switching model while running reloads it in the background
+$('modelSelect').onchange = async () => {
+  if (!running) return;
+  try { await loadModel(); } catch (err) { setStatus('dotModel', 'txtModel', 'err', 'Model error: ' + err.message); }
+};
+
+$('btnStart').onclick = async () => {
+  $('btnStart').disabled = true;
+  try {
+    speak('');                       // unlock speech after a user click
+    await startCamera();
+    await loadModel();
+    const was = running; running = true; $('btnStop').disabled = false; if (!was) loop();
+  } catch (err) {
+    setStatus('dotCam', 'txtCam', 'err', 'Error: ' + err.message);
+  } finally { $('btnStart').disabled = false; }
+};
+
+$('btnStop').onclick = () => {
+  running = false; $('btnStop').disabled = true;
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if ('speechSynthesis' in window) speechSynthesis.cancel();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  setStatus('dotCam', 'txtCam', '', 'Camera: stopped');
+};
+
+navigator.mediaDevices.enumerateDevices().then(() => listCameras());
+</script>
+</body>
+</html>
